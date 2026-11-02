@@ -31,6 +31,7 @@ pub enum ApiError {
     ValidationError(String),
     UnknownError(anyhow::Error),
     OverloadedError,
+    ReadOnlyMirrorError,
 }
 
 impl IntoResponse for ApiError {
@@ -75,6 +76,17 @@ impl IntoResponse for ApiError {
                 )
                     .into_response()
             }
+            ApiError::ReadOnlyMirrorError => (
+                StatusCode::FORBIDDEN,
+                Json(ApiErrorResponse {
+                    message:
+                        "This server is a read-only mirror; publish to the upstream server instead"
+                            .to_owned(),
+                    name: "ReadOnlyMirror".to_owned(),
+                    status_code: StatusCode::FORBIDDEN.as_u16(),
+                }),
+            )
+                .into_response(),
             ApiError::OverloadedError => {
                 let mut response = (
                     StatusCode::SERVICE_UNAVAILABLE,

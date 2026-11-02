@@ -94,6 +94,7 @@ pub async fn run(options: BackfillOptions) -> Result<BackfillSummary> {
     let pool = server::db::init_db(&database)
         .with_context(|| format!("failed to open database {}", database.display()))?;
     let mut conn = pool.get()?;
+    server::mirror::ensure_not_follower_database(&conn)?;
 
     let max_rows = options.limit.unwrap_or(usize::MAX);
     let mut stats = BatchStats::default();
@@ -275,6 +276,26 @@ mod tests {
         ] {
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    #[tokio::test]
+    async fn refuses_to_write_to_mirror_databases() {
+        let database = test_database_path();
+        let pool = server::db::init_db(&database).unwrap();
+        pool.get()
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO mirror_state (key, value) VALUES
+                   ('upstream_epoch', 'epoch'), ('upstream_change_seq', '1');",
+            )
+            .unwrap();
+        drop(pool);
+
+        let error = run(options(&database, false, None)).await.unwrap_err();
+        assert!(format!("{error:#}").contains("mirror of an upstream"));
+        run(options(&database, true, None)).await.unwrap();
+
+        cleanup(&database);
     }
 
     #[tokio::test]

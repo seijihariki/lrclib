@@ -8,6 +8,7 @@ pub mod db;
 pub mod entities;
 pub mod errors;
 pub mod lyricsfile;
+pub mod mirror;
 pub mod repositories;
 pub mod routes;
 pub mod search_index;

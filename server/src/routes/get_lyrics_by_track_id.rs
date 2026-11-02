@@ -101,7 +101,7 @@ mod tests {
     fn test_state() -> (Arc<AppState>, PathBuf) {
         let path = std::env::temp_dir().join(format!("lrclib-test-{}.sqlite3", Uuid::new_v4()));
         let pool = init_db(&path).expect("failed to initialize test database");
-        (crate::state::build_app_state(pool, None), path)
+        (crate::state::build_app_state(pool, None, false), path)
     }
 
     fn remove_test_database(path: &PathBuf) {

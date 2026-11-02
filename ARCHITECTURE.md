@@ -30,6 +30,7 @@ This is the public self-hosted product.
 - `server/src/entities/*.rs`: small DB/domain structs.
 - `server/src/lyricsfile.rs`: shared Lyricsfile parsing, legacy LRC conversion, YAML generation, and metadata retargeting used by the publish path.
 - `server/src/search_index.rs` + `server/src/search_index/*.rs`: embedded Tantivy search index over track metadata (schema, query building, polling indexer).
+- `server/src/mirror.rs` + `server/src/mirror/*.rs`: OSM-style replication (configuration and on-disk format, changelog triggers, diff writing/merging/applying, dumps, publisher schedule, follower).
 - `server/src/utils.rs`: input normalization, publish-token verification, cache helpers.
 - `server/migrations/*`: embedded SQLite schema/migrations, applied on startup.
 - `TANTIVY_SEARCH_PLAN.md`: implementation and rollout record for replacing the `/api/search` FTS5 query path with an embedded Tantivy index.
@@ -39,8 +40,10 @@ This is the public self-hosted product.
 Server startup in `server::serve`, implemented in `server/src/bootstrap.rs`:
 
 - init tracing from `LRCLIB_LOG`
+- parse mirror configuration (`LRCLIB_MIRROR_*`); when following an upstream and the database file does not exist, restore it from the upstream's latest dump
 - open SQLite pool
 - apply PRAGMAs + migrations
+- when following, require the database to carry an upstream position; install or remove mirror change capture to match publishing configuration (see Mirroring)
 - bootstrap the Tantivy search index + indexer thread; failures leave `/api/search` unavailable while other routes continue serving
 - build shared `AppState`
 - spawn background tasks
@@ -54,6 +57,8 @@ Background tasks:
 - recent lyrics counter: refreshes `last 10 minutes` publish count once/minute in `spawn_blocking`, so the indexed count query does not run on an async worker
 - daily `PRAGMA optimize`: waits 24h after startup (the startup `PRAGMA optimize=0x10002` already runs during `init_db`), then runs `PRAGMA optimize` once/day with `analysis_limit = 400` inside `spawn_blocking`, so maintenance does not block the async runtime or scan entire indexes on large databases
 - search indexer: dedicated OS thread that tails the `tracks` table into the Tantivy index (see Search Index)
+- mirror publisher (when enabled): one task writing due diffs at each base-period boundary and one independent task writing dumps, both in `spawn_blocking`
+- mirror follower (when enabled): polls the upstream diff stream and applies new diffs in `spawn_blocking`
 
 ## AppState
 
@@ -69,6 +74,7 @@ Background tasks:
 - Moka caches use AHash for lower-overhead in-memory key hashing.
 - `http_metrics`: aggregate HTTP metrics plus `/api/search` and metadata `/api/get` request, cache hit/miss, failure, route-latency, and backend-stage histograms; the reporter snapshots and resets these once per minute.
 - `recent_lyrics_count`: recent publish-volume metric used to calculate challenge difficulty.
+- `read_only`: set when following an upstream mirror; `POST /api/request-challenge`, `/api/publish`, and `/api/flag` then return `403 ReadOnlyMirror`.
 
 ## Layering
 
@@ -92,6 +98,8 @@ Routes are mounted under `/api` in `server/src/router.rs`.
 - `POST /api/request-challenge`: create proof-of-work challenge.
 - `POST /api/publish`: publish lyrics using challenge solution.
 - `POST /api/flag`: flag current lyrics for a track.
+
+When mirror publishing is enabled with `LRCLIB_MIRROR_SERVE` (default on), only the publish directory's `dumps/` and `replication/` subtrees are served under `/mirror/` (tower-http `ServeDir`, range requests supported). Hidden and in-progress files (`.tmp`, `.part`, `.partial`, `.lock`) return 404. `state.json` and `latest.json` are sent with `Cache-Control: no-cache`, everything else with `public, max-age=86400`, so a CDN in front never delays followers.
 
 ## Main Request Paths
 
@@ -170,6 +178,8 @@ Core schema is in `server/migrations/`.
 - `flags`: reports against a lyrics row.
 - `missing_tracks`: table created by migration 04; no code writes to it anymore.
 - `tracks_fts`: retained FTS5 virtual table over normalized track fields; it is not queried by `/api/search`.
+- `mirror_changes`: replication changelog `(seq AUTOINCREMENT, table_name, row_id)`; only written by runtime-installed triggers while mirror publishing is enabled.
+- `mirror_state`: key/value replication state (`publisher_epoch`, `publisher_pruned_seq` on publishers; `upstream_epoch`, `upstream_change_seq` on followers).
 
 Important DB behavior:
 
@@ -200,6 +210,54 @@ Current lyrics API responses remain backward-compatible:
 - Query semantics: `q` = AND of terms across the three columns; structured params = per-column phrase queries. Inputs are expected to be normalized by `utils::prepare_input`.
 - Tantivy emits its own `tracing` logs; use e.g. `LRCLIB_LOG=info,tantivy=warn` to quiet them.
 
+## Mirroring
+
+OpenStreetMap-style replication in `server/src/mirror*`: periodic full dumps plus chains of sequence-numbered diffs. A server can publish, follow, or both (a follower that also publishes re-publishes what it applies).
+
+Configuration (env, parsed by `MirrorConfig::from_env`; invalid values abort startup):
+
+- `LRCLIB_MIRROR_PUBLISH_DIR`: enables publishing into this directory.
+- `LRCLIB_MIRROR_DIFF_PERIODS` (default `1h,1d`): comma-separated diff streams, finest first; each must be a larger multiple of the previous. Units `s`, `m`, `h`, `d`, `w`. The first stream is built from the changelog, each later one by merging the previous stream.
+- `LRCLIB_MIRROR_DUMP_PERIOD` (default `7d`), `LRCLIB_MIRROR_KEEP_DUMPS` (default `1`, `0` keeps all), `LRCLIB_MIRROR_SERVE` (default `true`). A dump period shorter than the coarsest diff period is allowed but logs a warning, since every dump copies the whole database.
+- `LRCLIB_MIRROR_UPSTREAM`: enables following; base URL of an upstream `/mirror` tree (or a local directory). `LRCLIB_MIRROR_UPSTREAM_STREAM` (default `1h`) picks the upstream stream, `LRCLIB_MIRROR_UPSTREAM_POLL` (default `5m`) the poll interval.
+
+Period boundaries are aligned to multiples of the period since the Unix epoch in UTC: hourly on the hour, daily at midnight, `7d` on Thursdays 00:00 UTC.
+
+Change capture:
+
+- When publishing is enabled, `prepare_publisher` installs `AFTER INSERT/UPDATE/DELETE` triggers (named `lrclib_mirror_changes_<table>_{ai,au,ad}`; only these exact names are ever dropped) on `lyrics`, `flags`, `missing_tracks`, and `tracks` that append `(table, id)` to `mirror_changes`. Because they are database triggers, writes from the maintenance CLIs are captured too. `seq` is monotonic in commit order and never reused (read via `sqlite_sequence`, so it survives pruning).
+- When publishing is disabled, startup drops the triggers and clears the changelog so non-publishing servers never accumulate it. If nothing is installed this is a read-only check, so ordinary servers take no writer lock at startup.
+- An epoch id identifies one continuous changelog. Startup keeps the epoch only when the triggers exist and the published base stream covers everything already pruned; otherwise (first start, publishing re-enabled, publish dir lost) a new epoch starts, the changelog is cleared, and a dump is written immediately. Followers refuse diffs from a different epoch and must re-bootstrap. Startup also starts a new epoch when the database is behind what was already published or dumped (`latest_change_seq` below the published cursor, e.g. restored from a backup), because its change sequence would reuse numbers followers already applied.
+- One publisher per database and per publish directory: `prepare_publisher` takes exclusive process-lifetime locks on `<db>.mirror-publisher.lock` (keyed by canonical path) and `<dir>/.publisher.lock`, so a second instance fails at startup instead of pruning the other's changelog or overwriting its sequence numbers.
+
+Publish directory layout:
+
+```
+dumps/lrclib-<YYYYMMDDTHHMMSSZ>.sqlite3.gz   + .state.json, latest.json -> newest
+replication/<period>/state.json             newest diff state (followers poll this)
+replication/<period>/AAA/BBB/CCC.jsonl.gz   + CCC.state.json
+```
+
+- Diff data is gzip JSON lines (`{"op":"upsert","table":..,"row":{..}}` / `{"op":"delete","table":..,"id":..}`), grouped in `MIRRORED_TABLES` order with `tracks` last; within a table all deletes precede all upserts, so a row deleted and re-inserted under a new id with the same unique key (`tracks` and `missing_tracks` metadata) never conflicts, including in merged diffs. Each `(table, id)` appears once with its final state at `to_change_seq`, so applying is idempotent and overlapping a dump or earlier diff is harmless.
+- Base diffs (`write_base_diff`) read `to_change_seq` and all changed rows inside one read transaction (one WAL snapshot). After the diff's state files are published, `Publisher::run_due_diffs` prunes the changelog through `to_change_seq` in separate small write transactions. A base diff is written at every boundary, empty or not; after downtime one catch-up diff is labelled with the current boundary.
+- Coarser diffs (`merge_diffs`) merge the finer diffs since the previous aggregate whose nominal timestamp is at or before the boundary, newest first, keeping only the first op per key; memory is bounded by the key set. Ranges chain contiguously (`from_change_seq` = previous `to_change_seq`). A newly added coarser stream starts with the current window only, so followers of it need a dump newer than that window: an existing follower switched to a newly added stream fails with a gap error and must re-bootstrap, even though the finer history is on disk.
+- Dumps (`create_dump`) use `VACUUM INTO` (one snapshot, non-blocking for writers, needs free disk for an uncompressed copy). The copy's `sqlite_sequence` gives the dump's `change_seq`; publisher triggers, changelog, and state are stripped and `upstream_epoch` / `upstream_change_seq` are stamped in. Dumps run on their own task so they never delay diffs; long dumps hold a read snapshot, so the WAL can grow meanwhile.
+- Diff files and their per-sequence states are never deleted (OSM-style): followers walk back through per-sequence states, so pruning would strand slow followers. Disk use grows with change volume; operators can archive old sequences manually. Only dumps have retention (`LRCLIB_MIRROR_KEEP_DUMPS`).
+- A new epoch does not clear `replication/`: stream sequence numbers continue from the previous epoch's last sequence and old-epoch files stay in place (followers ignore them via the epoch check). Delete them manually if unwanted.
+- State and data files are written via synced temp file + rename + parent-directory fsync (`rename_durable`), so renames survive power loss; data before per-sequence state before the stream `state.json`, so readers never see a state pointing at a missing file. A crash mid-publish rewrites the same sequence on retry.
+
+Following:
+
+- Bootstrap (only when the database file does not exist): needs about twice the dump size free next to the database (compressed download plus restored file); the parent directory is created if missing. Download `dumps/latest.json`'s file, verify SHA-256, gunzip into place, then normal migrations run. Because publishers prune superseded dumps (default retention is 1), the chosen dump can vanish mid-bootstrap; on failure `latest.json` is re-read and a newer dump is retried immediately, while other failures retry with exponential backoff (5 attempts, 5s doubling up to 60s) before startup fails. After a restore, startup marks the search index stale (`search_index::invalidate`) so it is rebuilt from the restored database rather than keeping documents from a previous one.
+- Every upstream request and every body chunk has a 60s idle timeout (no total timeout, since dumps are large), so a stalled upstream surfaces as an error instead of hanging sync or startup.
+- Sync: read the stream `state.json`, walk back per-sequence states to the first diff with `from_change_seq <= upstream_change_seq`, then download (SHA-256 verified) and apply each in order. `apply_diff` runs one transaction per diff: update-by-id, else insert, else delete; column names are validated against local `PRAGMA table_info` (an unknown upstream column fails the sync until this server is upgraded). Foreign keys are disabled while applying because `tracks` and `lyrics` reference each other. The new upstream position is written in the same transaction. Transient failures (network, I/O) retry after `max(60s, poll interval)`. A new upstream epoch or a gap in the diff chain is permanent: it is logged once and following stops (the server keeps serving its current data) until an operator re-bootstraps. An upstream at the same position is a no-op; an upstream behind the local position (rewound within the same epoch) is permanent like an epoch change. A missing stream `state.json` is not an error (coarse streams appear only after their first boundary) but is logged once as a warning pointing at `LRCLIB_MIRROR_UPSTREAM_STREAM`, then once at info when it appears.
+- Local triggers keep working on followers (`tracks_fts`, `last_lyrics_id`); `tracks` is applied last so its exact upstream row wins. The Tantivy indexer picks up new tracks by id as usual, since diffs commit atomically and upstream ids are monotonic.
+- Mirroring assumes `tracks` rows are effectively append-only with immutable indexed name columns (true for every current write path). The format and triggers carry `tracks` updates and deletes, but the Tantivy indexer only appends `id > cursor`, so a replicated delete would leave a stale document whose result `get_tracks_by_ids` silently drops. Adding a write path that deletes or renames tracks requires teaching the indexer to remove documents.
+- Follower caches are not invalidated by applied diffs: like upstream publishes, `/api/get` and `/api/search` results converge within the cache TTL (up to 24h), but on a mirror that lag applies to every update.
+- Followers are read-only (see `AppState.read_only`) because local writes would collide with upstream ids. The maintenance backfills refuse to write to a follower database (`ensure_not_follower_database`); dry runs still work.
+- Mirror startup errors (invalid config, failed bootstrap, failed publisher preparation) print the full error chain and exit with status 1.
+- The crate exports only what startup and the CLI need (`MirrorConfig`, `Period`, state structs, `prepare_publisher`/`spawn_publisher`, follower bootstrap/guards/spawn); diff writing, merging, applying, and dumps are crate-private.
+
 ## Matching Rules
 
 Track matching is intentionally fuzzy but narrow:
@@ -223,4 +281,5 @@ If you change matching behavior, review both:
 - All new lyrics repository writes must supply a non-empty Lyricsfile; old rows may still contain `NULL`.
 - All new lyrics repository writes must pass `PreparedLyrics.has_word_sync`; word timing only exists in Lyricsfile `lines[].words`, never in legacy plain/synced text.
 - Historical Lyricsfile and word-sync population belongs in the root maintenance CLI; keep schema-aware batch SQL and its timestamp-invariance tests in `lyrics_repository`.
+- New mirrored tables must be added to `mirror::MIRRORED_TABLES` (apply order matters: `tracks` last). Column additions need no mirror changes, but followers must be upgraded before publishers start emitting the new column.
 - Schema changes require a new migration and usually repository updates. Migrations are append-only: never edit or renumber an applied migration; add a new numbered migration for each schema change.

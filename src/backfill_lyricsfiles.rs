@@ -112,6 +112,7 @@ pub async fn run(options: BackfillOptions) -> Result<BackfillSummary> {
     let pool = server::db::init_db(&database)
         .with_context(|| format!("failed to open database {}", database.display()))?;
     let mut conn = pool.get()?;
+    server::mirror::ensure_not_follower_database(&conn)?;
     let initial_candidates = lyrics_repository::count_lyricsfile_backfill_candidates(&mut conn)?;
     println!("Lyricsfile backfill candidates: {initial_candidates}");
 

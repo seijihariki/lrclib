@@ -280,7 +280,7 @@ mod tests {
             .reload_reader()
             .expect("failed to reload search index reader");
 
-        let state = crate::state::build_app_state(pool, Some(search_index));
+        let state = crate::state::build_app_state(pool, Some(search_index), false);
 
         SearchIndexTestState {
             state,
@@ -504,7 +504,7 @@ mod tests {
         // Index attached but no indexer running: never becomes ready.
         let search_index =
             Arc::new(SearchIndex::open_or_create(&index_dir).expect("failed to open search index"));
-        let state = crate::state::build_app_state(pool, Some(search_index));
+        let state = crate::state::build_app_state(pool, Some(search_index), false);
 
         let error = match route(
             Query(QueryParams {

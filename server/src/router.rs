@@ -1,5 +1,7 @@
 use crate::{
+    errors::ApiError,
     metrics::MonitoredRoute,
+    mirror::{DUMPS_DIR, REPLICATION_DIR},
     routes::{
         flag_lyrics, get_lyrics_by_metadata, get_lyrics_by_track_id, publish_lyrics,
         request_challenge, search_lyrics,
@@ -11,27 +13,29 @@ use axum::{
     extract::{Request as AxumRequest, State},
     http::{header, Request},
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
 use std::{
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
 use tower_http::{
     classify::ServerErrorsFailureClass,
     cors::{Any, CorsLayer},
+    services::ServeDir,
     trace::TraceLayer,
 };
 use tracing::Span;
 
 /// Builds the application router with all routes, middleware, and CORS configuration.
-pub(crate) fn build_router(state: Arc<AppState>) -> Router {
+pub(crate) fn build_router(state: Arc<AppState>, mirror_dir: Option<PathBuf>) -> Router {
     let state_for_request_metrics = Arc::clone(&state);
     let state_for_response_metrics = Arc::clone(&state);
 
-    let api_routes = Router::new()
+    let read_routes = Router::new()
         .route(
             "/get",
             get(get_lyrics_by_metadata::route).layer(middleware::from_fn_with_state(
@@ -46,13 +50,25 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
                 Arc::clone(&state),
                 record_search_metrics,
             )),
-        )
-        .route("/request-challenge", post(request_challenge::route))
-        .route("/publish", post(publish_lyrics::route))
-        .route("/flag", post(flag_lyrics::route));
+        );
+    let api_routes = if state.read_only {
+        read_routes
+            .route("/request-challenge", post(read_only_mirror))
+            .route("/publish", post(read_only_mirror))
+            .route("/flag", post(read_only_mirror))
+    } else {
+        read_routes
+            .route("/request-challenge", post(request_challenge::route))
+            .route("/publish", post(publish_lyrics::route))
+            .route("/flag", post(flag_lyrics::route))
+    };
 
-    Router::new()
-        .nest("/api", api_routes)
+    let mut router = Router::new().nest("/api", api_routes);
+    if let Some(dir) = mirror_dir {
+        router = router.nest("/mirror", mirror_routes(&dir));
+    }
+
+    router
         .with_state(state)
         .layer(
             TraceLayer::new_for_http()
@@ -102,6 +118,51 @@ pub(crate) fn build_router(state: Arc<AppState>) -> Router {
                 ])
                 .expose_headers([header::RETRY_AFTER]),
         )
+}
+
+/// Only the published subtrees, so other files in the publish directory (locks,
+/// or a database placed alongside) are never exposed.
+fn mirror_routes<S: Clone + Send + Sync + 'static>(dir: &Path) -> Router<S> {
+    Router::new()
+        .nest_service(&format!("/{DUMPS_DIR}"), ServeDir::new(dir.join(DUMPS_DIR)))
+        .nest_service(
+            &format!("/{REPLICATION_DIR}"),
+            ServeDir::new(dir.join(REPLICATION_DIR)),
+        )
+        .layer(middleware::from_fn(mirror_file_policy))
+}
+
+/// State files change in place and must be revalidated; everything else is
+/// written once.
+async fn mirror_file_policy(request: AxumRequest, next: Next) -> Response {
+    let path = request.uri().path().to_owned();
+    let hidden = path.split('/').any(|segment| {
+        segment.starts_with('.')
+            || [".tmp", ".part", ".partial", ".lock"]
+                .iter()
+                .any(|suffix| segment.ends_with(suffix))
+    });
+    if hidden {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    }
+
+    let mut response = next.run(request).await;
+    if response.status().is_success() {
+        let cache_control = if path.ends_with("/state.json") || path.ends_with("/latest.json") {
+            "no-cache"
+        } else {
+            "public, max-age=86400"
+        };
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static(cache_control),
+        );
+    }
+    response
+}
+
+async fn read_only_mirror() -> ApiError {
+    ApiError::ReadOnlyMirrorError
 }
 
 async fn record_search_metrics(

@@ -31,6 +31,40 @@ You have three environment variables available to tweak the database connection:
 
 Use these variables to optimize memory usage in low traffic and/or low memory situations. The default values are generously sized to be used on a production system.
 
+## Mirroring
+
+LRCLIB can publish its database for mirrors and can run as a mirror of another server. The model is the same as OpenStreetMap's: full dumps every week, plus hourly diffs that are aggregated into daily diffs.
+
+### Publishing
+
+* `LRCLIB_MIRROR_PUBLISH_DIR`: enables publishing. Dumps and diffs are written here.
+* `LRCLIB_MIRROR_DIFF_PERIODS` (default `1h,1d`): comma-separated diff periods, finest first. Each period must be a larger multiple of the previous one (e.g. `1m,1h,1d`). Units: `s`, `m`, `h`, `d`, `w`.
+* `LRCLIB_MIRROR_DUMP_PERIOD` (default `7d`): how often a full dump is written.
+* `LRCLIB_MIRROR_KEEP_DUMPS` (default `1`): number of dumps kept on disk; `0` keeps all.
+* `LRCLIB_MIRROR_SERVE` (default `true`): serve the published `dumps/` and `replication/` subtrees at `/mirror/`. Set to `false` to serve them with a separate web server or CDN instead; if you do, keep `state.json`/`latest.json` uncached (this server sends `Cache-Control: no-cache` for them) and do not expose other files in the directory.
+
+Periods are aligned to UTC (hourly on the hour, daily at midnight; `7d` falls on Thursdays). Writing a dump temporarily needs free disk space for an uncompressed copy of the database. Diff files are never deleted (as with OpenStreetMap), so the publish directory grows over time; only dumps are rotated. Only one server may publish from a given database or into a given directory; a second one fails at startup.
+
+### Following another server
+
+* `LRCLIB_MIRROR_UPSTREAM`: base URL of the upstream mirror tree, e.g. `https://lrclib.example/mirror`, or a local directory containing it.
+* `LRCLIB_MIRROR_UPSTREAM_STREAM` (default `1h`): which upstream diff period to follow.
+* `LRCLIB_MIRROR_UPSTREAM_POLL` (default `5m`): how often to check for new diffs.
+
+If the database file does not exist, it is downloaded from the upstream's latest dump on startup. Afterwards new diffs are applied automatically. A following server is read-only: publishing and flagging return `403`.
+
+```shell
+LRCLIB_MIRROR_UPSTREAM=https://lrclib.example/mirror cargo run --release -- serve --database mirror.sqlite3
+```
+
+Bootstrapping needs about twice the dump size of free disk space next to the database file (the download plus the restored database). The search index is rebuilt after bootstrapping.
+
+`LRCLIB_MIRROR_UPSTREAM_STREAM` must match one of the upstream's `LRCLIB_MIRROR_DIFF_PERIODS`; if the stream does not exist, the mirror logs a warning and keeps waiting. Coarser streams appear only after their first period boundary, and switching an existing mirror to a stream the upstream added later requires re-bootstrapping.
+
+If the upstream starts a new replication epoch (for example after it disabled and re-enabled publishing), or its database is restored to an earlier state, the mirror logs an error and stops following while it keeps serving its current data. To re-bootstrap from a fresh dump, delete the database file and restart.
+
+The `backfill-*` maintenance commands refuse to modify a mirror's database; run them on the upstream instead.
+
 ## Setup with Podman/Docker
 
 ### Basic

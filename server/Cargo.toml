@@ -7,7 +7,7 @@ edition = "2021"
 tokio = { version = "1.37.0", features = ["full"] }
 axum = { version = "0.7.5", features = ["tracing"] }
 axum-macros = "0.4.1"
-tower-http = { version = "0.5.0", features = ["trace", "cors"] }
+tower-http = { version = "0.5.0", features = ["trace", "cors", "fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 r2d2 = "0.8.10"
@@ -38,3 +38,4 @@ validator = { version = "0.18.1", features = ["derive"] }
 num-bigint = "0.4.6"
 dashmap = "6.1.0"
 tantivy = "0.26"
+flate2 = "1.1"

@@ -36,6 +36,7 @@ pub struct AppState {
     pub(crate) recent_lyrics_count: AtomicUsize,
     pub(crate) load_permits: Arc<Semaphore>,
     pub(crate) load_queue_timeout: Duration,
+    pub(crate) read_only: bool,
 }
 
 impl AppState {
@@ -65,6 +66,7 @@ impl AppState {
 pub(crate) fn build_app_state(
     pool: Pool<SqliteConnectionManager>,
     search_index: Option<Arc<SearchIndex>>,
+    read_only: bool,
 ) -> Arc<AppState> {
     let max_concurrent_loads = std::env::var("LRCLIB_MAX_CONCURRENT_LOADS")
         .ok()
@@ -106,5 +108,6 @@ pub(crate) fn build_app_state(
         recent_lyrics_count: AtomicUsize::new(0),
         load_permits: Arc::new(Semaphore::new(max_concurrent_loads)),
         load_queue_timeout: Duration::from_millis(load_queue_timeout_ms),
+        read_only,
     })
 }

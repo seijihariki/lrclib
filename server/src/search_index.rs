@@ -276,6 +276,19 @@ fn register_tokenizer(index: &Index) {
     index.tokenizers().register(TOKENIZER_NAME, analyzer);
 }
 
+/// Marks an existing index stale so the next startup rebuilds it from
+/// SQLite. Needed whenever the database file is replaced (mirror bootstrap):
+/// the indexer only appends `id > cursor`, so documents for rows the new
+/// database lacks would otherwise survive.
+pub fn invalidate(dir: &Path) -> Result<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    ensure_safe_to_recreate(dir)?;
+    std::fs::write(dir.join(VERSION_FILE_NAME), "0")?;
+    Ok(())
+}
+
 fn stored_version(dir: &Path) -> Option<u32> {
     std::fs::read_to_string(dir.join(VERSION_FILE_NAME))
         .ok()?
@@ -547,6 +560,22 @@ mod tests {
         let recreated = SearchIndex::open_or_create(&dir).unwrap();
         assert_eq!(recreated.num_docs(), 0);
         assert_eq!(stored_version(&dir), Some(INDEX_FORMAT_VERSION));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn invalidated_indexes_rebuild_on_next_open() {
+        let dir = test_dir();
+        invalidate(&dir).unwrap();
+        {
+            let search_index = SearchIndex::open_or_create(&dir).unwrap();
+            seed(&search_index, &[doc(1, "old song", "artist", "album")]);
+        }
+        invalidate(&dir).unwrap();
+
+        let recreated = SearchIndex::open_or_create(&dir).unwrap();
+        assert_eq!(recreated.num_docs(), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
